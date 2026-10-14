@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+# Run native Qt integration tests on headless CI workers.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:

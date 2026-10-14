@@ -18,7 +18,7 @@ from vnpy.trader.object import (
 )
 from vnpy.trader.setting import SETTINGS
 from vnpy.trader.utility import TEMP_DIR
-from vnpy_portfoliostrategy.base import APP_NAME
+from vnpy_portfoliostrategy.base import APP_NAME, EVENT_PORTFOLIO_STRATEGY
 from vnpy_portfoliostrategy.engine import StrategyEngine
 from vnpy_portfoliostrategy.template import StrategyTemplate
 
@@ -300,3 +300,79 @@ class TestTargetPosition:
         assert strategy.get_pos(AG) == 1
         assert strategy.get_target(RB) == -1
         assert strategy.get_target(AG) == 1
+
+
+# Regression cases reuse the upstream EngineRig fixture.
+
+
+@pytest.mark.parametrize("error", [RuntimeError, ValueError, TypeError])
+def test_start_exception_keeps_strategy_stopped(rig: EngineRig, monkeypatch: pytest.MonkeyPatch, error: type[Exception]) -> None:
+    strategy = rig.strategy
+    strategy.inited = True
+
+    def fail_start() -> None:
+        raise error("startup regression")
+
+    monkeypatch.setattr(strategy, "on_start", fail_start)
+    rig.engine.start_strategy(strategy.strategy_name)
+
+    assert strategy.inited is False
+    assert strategy.trading is False
+    state_events = [event for event in rig.engine.event_engine.events if event.type == EVENT_PORTFOLIO_STRATEGY]
+    assert state_events[-1].data["variables"]["inited"] is False
+    assert state_events[-1].data["variables"]["trading"] is False
+    assert strategy.buy(RB, 3500, 1) == []
+    assert rig.gateway.order_requests == []
+
+
+def test_start_callback_finishes_before_trading_is_enabled(rig: EngineRig, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = rig.strategy
+    strategy.inited = True
+    observed: list[bool] = []
+
+    def on_start() -> None:
+        observed.append(strategy.trading)
+        assert strategy.buy(RB, 3500, 1) == []
+
+    monkeypatch.setattr(strategy, "on_start", on_start)
+    assert rig.engine.start_strategy(strategy.strategy_name) is None
+    assert observed == [False]
+    assert strategy.inited is True
+    assert strategy.trading is True
+    assert rig.gateway.order_requests == []
+
+
+def test_stop_after_failed_restart_still_cancels_pending_orders(rig: EngineRig, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = rig.strategy
+    strategy.inited = True
+    rig.engine.start_strategy(strategy.strategy_name)
+    identity = strategy.buy(RB, 3500, 1)[0]
+    rig.engine.stop_strategy(strategy.strategy_name)
+    assert identity in strategy.active_orderids
+
+    def fail_start() -> None:
+        strategy.set_target(RB, 2)
+        raise RuntimeError("restart regression")
+
+    monkeypatch.setattr(strategy, "on_start", fail_start)
+    rig.engine.start_strategy(strategy.strategy_name)
+    rig.engine.stop_strategy(strategy.strategy_name)
+    assert len(rig.gateway.cancel_requests) == 2
+    assert rig.engine.strategy_data[strategy.strategy_name]["target_data"].get(RB) == 2
+
+
+def test_failed_restart_cannot_remove_strategy_with_pending_orders(rig: EngineRig, monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = rig.strategy
+    strategy.inited = True
+    rig.engine.start_strategy(strategy.strategy_name)
+    identity = strategy.buy(RB, 3500, 1)[0]
+    rig.engine.stop_strategy(strategy.strategy_name)
+
+    def fail_start() -> None:
+        raise RuntimeError("restart regression")
+
+    monkeypatch.setattr(strategy, "on_start", fail_start)
+    rig.engine.start_strategy(strategy.strategy_name)
+    assert rig.engine.remove_strategy(strategy.strategy_name) is False
+    assert rig.engine.orderid_strategy_map[identity] is strategy
+    assert strategy.strategy_name in rig.engine.strategies
