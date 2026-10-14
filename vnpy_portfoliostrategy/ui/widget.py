@@ -108,10 +108,11 @@ class PortfolioStrategyManager(QtWidgets.QWidget):
         )
 
     def process_strategy_event(self, event: Event) -> None:
-        """策略事件推送"""
+        """只刷新当前策略实例，丢弃同名旧实例的缓存事件。"""
         data: dict = event.data
+        if not self.strategy_engine.is_strategy_event_current(data):
+            return
         strategy_name: str = data["strategy_name"]
-
         if strategy_name in self.managers:
             manager: StrategyManager = self.managers[strategy_name]
             manager.update_data(data)
@@ -172,6 +173,7 @@ class StrategyManager(QtWidgets.QFrame):
         self._data: dict = data
 
         self.init_ui()
+        self.update_data(data)
 
     def init_ui(self) -> None:
         """初始化界面"""
@@ -224,31 +226,19 @@ class StrategyManager(QtWidgets.QFrame):
         self.setLayout(vbox)
 
     def update_data(self, data: dict) -> None:
-        """更新策略数据"""
+        """每次刷新全部按钮，包括异常退回未初始化状态。"""
         self._data = data
-
         self.parameters_monitor.update_data(data["parameters"])
         self.variables_monitor.update_data(data["variables"])
-
-        # 更新按钮状态
         variables: dict = data["variables"]
         inited: bool = variables["inited"]
         trading: bool = variables["trading"]
-
-        if not inited:
-            return
-        self.init_button.setEnabled(False)
-
-        if trading:
-            self.start_button.setEnabled(False)
-            self.stop_button.setEnabled(True)
-            self.edit_button.setEnabled(False)
-            self.remove_button.setEnabled(False)
-        else:
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
-            self.edit_button.setEnabled(True)
-            self.remove_button.setEnabled(True)
+        pending: bool = bool(data.get("active_orderids"))
+        self.init_button.setEnabled(not inited and not trading)
+        self.start_button.setEnabled(inited and not trading)
+        self.stop_button.setEnabled(trading or pending)
+        self.edit_button.setEnabled(not trading)
+        self.remove_button.setEnabled(not trading and not pending)
 
     def init_strategy(self) -> None:
         """初始化策略"""

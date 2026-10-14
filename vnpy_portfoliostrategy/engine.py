@@ -10,6 +10,8 @@ from collections.abc import Callable
 from typing import Any, cast
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
+from threading import RLock
+from uuid import uuid4
 
 from vnpy.event import Event, EventEngine
 from vnpy.trader.engine import BaseEngine, MainEngine, LogEngine
@@ -51,6 +53,20 @@ from .locale import _
 from .template import StrategyTemplate
 
 
+
+class _StrategyLifecycle:
+    """仅在引擎锁内读写的生命周期记录，按实例区分重用的策略名称。"""
+
+    def __init__(self) -> None:
+        self.identity: str = uuid4().hex
+        self.event_revision: int = 0
+        self.operation: str = ""
+        self.revision: int = 0
+        self.failed: bool = False
+        self.restored: bool = False
+        self.cleaning: bool = False
+
+
 class StrategyEngine(BaseEngine):
     """组合策略引擎"""
 
@@ -74,6 +90,9 @@ class StrategyEngine(BaseEngine):
         self.init_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
 
         self.vt_tradeids: set[str] = set()
+        self._lifecycle_lock = RLock()
+        self._lifecycles: dict[int, _StrategyLifecycle] = {}
+        self._closed: bool = False
 
         # 数据库和数据服务
         self.database: BaseDatabase = get_database()
@@ -89,7 +108,9 @@ class StrategyEngine(BaseEngine):
         self.write_log(_("组合策略引擎初始化成功"))
 
     def close(self) -> None:
-        """关闭"""
+        """关闭后禁止后台完成结果重新开启策略。"""
+        with self._lifecycle_lock:
+            self._closed = True
         self.stop_all_strategies()
 
     def register_event(self) -> None:
@@ -135,14 +156,15 @@ class StrategyEngine(BaseEngine):
                 self.call_strategy_func(strategy, strategy.on_tick, tick)
 
     def process_order_event(self, event: Event) -> None:
-        """委托数据推送"""
+        """委托回报保持路由，异常停止后的终态回报刷新清理按钮。"""
         order: OrderData = event.data
-
-        strategy: StrategyTemplate | None = self.orderid_strategy_map.get(order.vt_orderid, None)
-        if not strategy:
+        strategy: StrategyTemplate | None = self.orderid_strategy_map.get(order.vt_orderid)
+        if strategy is None:
             return
-
+        active_before: set[str] = set(strategy.active_orderids)
         self.call_strategy_func(strategy, strategy.update_order, order)
+        if not strategy.inited and active_before != strategy.active_orderids:
+            self.put_strategy_event(strategy)
 
     def process_trade_event(self, event: Event) -> None:
         """成交数据推送"""
@@ -341,18 +363,14 @@ class StrategyEngine(BaseEngine):
         return data
 
     def call_strategy_func(self, strategy: StrategyTemplate, func: Callable, params: object = None) -> None:
-        """安全调用策略函数"""
+        """安全调用策略函数，保留原返回值和参数约定。"""
         try:
             if params:
                 func(params)
             else:
                 func()
         except Exception:
-            strategy.trading = False
-            strategy.inited = False
-
-            msg: str = _("触发异常已停止\n{}").format(traceback.format_exc())
-            self.write_log(msg, strategy)
+            self._fail_strategy(strategy)
 
     def add_strategy(
         self, class_name: str, strategy_name: str, vt_symbols: list, setting: dict
@@ -379,94 +397,77 @@ class StrategyEngine(BaseEngine):
         self.put_strategy_event(strategy)
 
     def init_strategy(self, strategy_name: str) -> None:
-        """初始化策略"""
-        self.init_executor.submit(self._init_strategy, strategy_name)
+        """预留初始化后交给线程池，重复请求不会排队重试。"""
+        strategy: StrategyTemplate | None = self.strategies.get(strategy_name)
+        if strategy is None:
+            return
+        reserved = self._begin_lifecycle(strategy, "init")
+        if reserved is None:
+            return
+        state, revision = reserved
+        try:
+            self.init_executor.submit(self._initialize_strategy, strategy, state, revision)
+        except BaseException:
+            self._finish_lifecycle(state)
+            raise
 
     def _init_strategy(self, strategy_name: str) -> None:
-        """初始化策略"""
+        """同步初始化，复用同一预留与完成规则。"""
         strategy: StrategyTemplate = self.strategies[strategy_name]
-
-        if strategy.inited:
-            self.write_log(_("{}已经完成初始化，禁止重复操作").format(strategy_name))
-            return
-
-        self.write_log(_("{}开始执行初始化").format(strategy_name))
-
-        # 调用策略on_init函数
-        self.call_strategy_func(strategy, strategy.on_init)
-
-        # 恢复策略状态
-        data: dict | None = self.strategy_data.get(strategy_name, None)
-        if data:
-            name: str
-            for name in strategy.variables:
-                value: object | None = data.get(name, None)
-                if value is None:
-                    continue
-
-                # 对于持仓和目标数据字典，需要使用dict.update更新defaultdict
-                if name in {"pos_data", "target_data"}:
-                    # 持仓和目标都是字典，但值类型不同
-                    strategy_data: Any = getattr(strategy, name)
-                    strategy_data.update(value)
-                # 对于其他int/float/str/bool字段则可以直接赋值
-                else:
-                    setattr(strategy, name, value)
-
-        # 订阅行情
-        vt_symbol: str
-        for vt_symbol in strategy.vt_symbols:
-            contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
-            if contract:
-                req: SubscribeRequest = SubscribeRequest(
-                    symbol=contract.symbol, exchange=contract.exchange)
-                self.main_engine.subscribe(req, contract.gateway_name)
-            else:
-                self.write_log(_("行情订阅失败，找不到合约{}").format(vt_symbol), strategy)
-
-        # 推送策略事件通知初始化完成状态
-        strategy.inited = True
-        self.put_strategy_event(strategy)
-        self.write_log(_("{}初始化完成").format(strategy_name))
+        reserved = self._begin_lifecycle(strategy, "init")
+        if reserved is not None:
+            self._initialize_strategy(strategy, *reserved)
 
     def start_strategy(self, strategy_name: str) -> None:
-        """启动策略"""
+        """启动回调完成后才允许交易；停止或异常使旧完成结果失效。"""
         strategy: StrategyTemplate = self.strategies[strategy_name]
-        if not strategy.inited:
-            self.write_log(_("策略{}启动失败，请先初始化").format(strategy.strategy_name))
+        reserved = self._begin_lifecycle(strategy, "start")
+        if reserved is None:
             return
-
-        if strategy.trading:
-            self.write_log(_("{}已经启动，请勿重复操作").format(strategy_name))
-            return
-
-        # 调用策略on_start函数
-        self.call_strategy_func(strategy, strategy.on_start)
-
-        # 推送策略事件通知启动完成状态
-        strategy.trading = True
-        self.put_strategy_event(strategy)
+        state, revision = reserved
+        try:
+            self.call_strategy_func(strategy, strategy.on_start)
+            with self._lifecycle_lock:
+                if state.revision != revision or self._closed:
+                    return
+                strategy.trading = strategy.inited
+                state.failed = not strategy.inited
+            self.put_strategy_event(strategy)
+        finally:
+            self._finish_lifecycle(state)
 
     def stop_strategy(self, strategy_name: str) -> None:
-        """停止策略"""
+        """停止在途启动，或清理运行及失败实例的委托与已恢复状态。"""
         strategy: StrategyTemplate = self.strategies[strategy_name]
-        if not strategy.trading:
-            return
-
-        # 调用策略on_stop函数
-        self.call_strategy_func(strategy, strategy.on_stop)
-
-        # 将交易状态设为False
-        strategy.trading = False
-
-        # 撤销全部委托
-        self.cancel_all(strategy)
-
-        # 同步数据状态
-        self.sync_strategy_data(strategy)
-
-        # 推送策略事件通知停止完成状态
-        self.put_strategy_event(strategy)
+        with self._lifecycle_lock:
+            state = self._lifecycles.setdefault(id(strategy), _StrategyLifecycle())
+            if state.operation == "stop" or state.cleaning:
+                return
+            busy: bool = bool(state.operation)
+            if not busy and not strategy.trading and not state.failed and not strategy.active_orderids:
+                return
+            call_stop: bool = strategy.trading and not busy
+            if busy:
+                state.revision += 1
+                strategy.trading = False
+            else:
+                state.operation = "stop"
+            state.cleaning = True
+        try:
+            if call_stop:
+                self.call_strategy_func(strategy, strategy.on_stop)
+            with self._lifecycle_lock:
+                strategy.trading = False
+            self.cancel_all(strategy)
+            # 首次初始化未恢复成功时，默认空值不能覆盖已有持仓。
+            if state.restored or strategy.inited:
+                self.sync_strategy_data(strategy)
+            self.put_strategy_event(strategy)
+        finally:
+            with self._lifecycle_lock:
+                state.cleaning = False
+            if not busy:
+                self._finish_lifecycle(state)
 
     def edit_strategy(self, strategy_name: str, setting: dict) -> None:
         """编辑策略参数"""
@@ -477,28 +478,20 @@ class StrategyEngine(BaseEngine):
         self.put_strategy_event(strategy)
 
     def remove_strategy(self, strategy_name: str) -> bool:
-        """移除策略实例"""
-        strategy: StrategyTemplate = self.strategies[strategy_name]
-        if strategy.trading:
-            self.write_log(_("策略{}移除失败，请先停止").format(strategy.strategy_name))
-            return False
-
-        vt_symbol: str
-        for vt_symbol in strategy.vt_symbols:
-            strategies: list = self.symbol_strategy_map[vt_symbol]
-            strategies.remove(strategy)
-
-        vt_orderid: str
-        for vt_orderid in strategy.active_orderids:
-            if vt_orderid in self.orderid_strategy_map:
-                self.orderid_strategy_map.pop(vt_orderid)
-
-        self.strategies.pop(strategy_name)
-        self.save_strategy_setting()
-
-        self.strategy_data.pop(strategy_name, None)
-        save_json(self.data_filename, self.strategy_data)
-
+        """生命周期操作或活动委托仍在途时保留策略与回报映射。"""
+        with self._lifecycle_lock:
+            strategy: StrategyTemplate = self.strategies[strategy_name]
+            state = self._lifecycles.setdefault(id(strategy), _StrategyLifecycle())
+            if state.operation or state.cleaning or strategy.trading or strategy.active_orderids:
+                self.write_log(_("策略{}移除失败，请先停止").format(strategy.strategy_name))
+                return False
+            for vt_symbol in strategy.vt_symbols:
+                self.symbol_strategy_map[vt_symbol].remove(strategy)
+            self.strategies.pop(strategy_name)
+            self._lifecycles.pop(id(strategy), None)
+            self.save_strategy_setting()
+            self.strategy_data.pop(strategy_name, None)
+            save_json(self.data_filename, self.strategy_data)
         return True
 
     def load_strategy_class(self) -> None:
@@ -615,8 +608,18 @@ class StrategyEngine(BaseEngine):
         save_json(self.setting_filename, strategy_setting)
 
     def put_strategy_event(self, strategy: StrategyTemplate) -> None:
-        """推送事件更新策略界面"""
+        """推送策略状态和活动委托，供界面决定清理权限。"""
+        with self._lifecycle_lock:
+            if self.strategies.get(strategy.strategy_name) is not strategy:
+                return
+            state = self._lifecycles.setdefault(id(strategy), _StrategyLifecycle())
+            identity: str = state.identity
+            state.event_revision += 1
+            event_revision: int = state.event_revision
         data: dict = strategy.get_data()
+        data["_strategy_instance_id"] = identity
+        data["_strategy_event_revision"] = event_revision
+        data["active_orderids"] = list(strategy.active_orderids)
         event: Event = Event(EVENT_PORTFOLIO_STRATEGY, data)
         self.event_engine.put(event)
 
@@ -637,3 +640,110 @@ class StrategyEngine(BaseEngine):
             subject = _("组合策略引擎")
 
         self.main_engine.send_notification(msg, subject)
+
+    def _begin_lifecycle(self, strategy: StrategyTemplate, operation: str) -> tuple[_StrategyLifecycle, int] | None:
+        """预留操作；锁只保护状态，不覆盖用户回调。"""
+        with self._lifecycle_lock:
+            if self._closed or self.strategies.get(strategy.strategy_name) is not strategy:
+                return None
+            state = self._lifecycles.setdefault(id(strategy), _StrategyLifecycle())
+            if state.operation or state.cleaning:
+                self.write_log(_("策略{}正在执行生命周期操作，请稍后重试").format(strategy.strategy_name))
+                return None
+            if operation == "init" and strategy.inited:
+                self.write_log(_("{}已经完成初始化，禁止重复操作").format(strategy.strategy_name))
+                return None
+            if operation == "start":
+                if not strategy.inited:
+                    self.write_log(_("策略{}启动失败，请先初始化").format(strategy.strategy_name))
+                    return None
+                if strategy.trading:
+                    self.write_log(_("{}已经启动，请勿重复操作").format(strategy.strategy_name))
+                    return None
+                state.restored = True
+            state.operation = operation
+            state.revision += 1
+            return state, state.revision
+
+    def _finish_lifecycle(self, state: _StrategyLifecycle) -> None:
+        """释放操作，无论回调返回、抛异常或请求退出。"""
+        with self._lifecycle_lock:
+            state.operation = ""
+
+    def _fail_strategy(self, strategy: StrategyTemplate) -> None:
+        """异常使在途操作失效，并通知原界面。"""
+        with self._lifecycle_lock:
+            if self.strategies.get(strategy.strategy_name) is strategy:
+                state = self._lifecycles.setdefault(id(strategy), _StrategyLifecycle())
+                state.revision += 1
+                state.failed = True
+            strategy.trading = False
+            strategy.inited = False
+        msg: str = _("触发异常已停止\n{}").format(traceback.format_exc())
+        self.write_log(msg, strategy)
+        self.put_strategy_event(strategy)
+
+    def _initialize_strategy(self, strategy: StrategyTemplate, state: _StrategyLifecycle, revision: int) -> None:
+        """只有完整初始化正常完成才能进入就绪状态。"""
+        try:
+            with self._lifecycle_lock:
+                if state.revision != revision or self._closed:
+                    return
+            self.write_log(_("{}开始执行初始化").format(strategy.strategy_name))
+            self.call_strategy_func(strategy, strategy.on_init)
+
+            with self._lifecycle_lock:
+                if state.revision != revision or self._closed:
+                    return
+                # 同一进程内恢复保留较新的成交，不重新覆盖为旧保存值。
+                if not state.restored:
+                    data: dict | None = self.strategy_data.get(strategy.strategy_name)
+                    if data:
+                        for name in strategy.variables:
+                            if name in {"inited", "trading"}:
+                                continue
+                            value: object | None = data.get(name)
+                            if value is None:
+                                continue
+                            if name in {"pos_data", "target_data"}:
+                                strategy_data: Any = getattr(strategy, name)
+                                strategy_data.update(value)
+                            else:
+                                setattr(strategy, name, value)
+                    state.restored = True
+
+            for vt_symbol in strategy.vt_symbols:
+                contract: ContractData | None = self.main_engine.get_contract(vt_symbol)
+                if contract:
+                    req = SubscribeRequest(symbol=contract.symbol, exchange=contract.exchange)
+                    self.main_engine.subscribe(req, contract.gateway_name)
+                else:
+                    self.write_log(_("行情订阅失败，找不到合约{}").format(vt_symbol), strategy)
+
+            with self._lifecycle_lock:
+                if state.revision != revision or self._closed:
+                    return
+                strategy.inited = True
+                state.failed = False
+            self.put_strategy_event(strategy)
+            self.write_log(_("{}初始化完成").format(strategy.strategy_name))
+        except Exception:
+            self._fail_strategy(strategy)
+        finally:
+            self._finish_lifecycle(state)
+
+    def is_strategy_event_current(self, data: dict) -> bool:
+        """识别已移除实例的缓存事件；兼容原来不带身份的事件。"""
+        identity: str | None = data.get("_strategy_instance_id")
+        if identity is None:
+            return True
+        with self._lifecycle_lock:
+            strategy = self.strategies.get(data["strategy_name"])
+            if strategy is None:
+                return False
+            state = self._lifecycles.get(id(strategy))
+            return (
+                state is not None
+                and state.identity == identity
+                and data.get("_strategy_event_revision", state.event_revision) == state.event_revision
+            )
